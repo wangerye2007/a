@@ -1,0 +1,101 @@
+name: Build ALVR Qiyu APK
+
+on:
+  push:
+    branches: [main, master]
+  workflow_dispatch: {}      # allows manual "Run workflow" from the Actions tab
+  pull_request:
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      ALVR_TAG: v20.14.1
+      NDK_VERSION: 25.1.8937393
+      GRADLE_VERSION: 7.6.1
+      CARGO_NDK_VERSION: 4.1.2
+      CBINDGEN_VERSION: 0.26.0
+
+    steps:
+      - name: Checkout this client repo
+        uses: actions/checkout@v4
+
+      - name: Set up JDK 17
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Set up Android SDK (cmdline-tools)
+        uses: android-actions/setup-android@v4
+      - name: Accept Android SDK licenses
+        # android-actions/setup-android does NOT auto-accept licenses; without
+        # this, the next step's `sdkmanager` install fails/hangs on a prompt.
+        run: yes | sdkmanager --licenses >/dev/null
+      - name: Install Android packages
+        run: |
+          # Pin the SDK root to the GitHub runner's standard location so the
+          # NDK is installed at <root>/ndk/<ver> (single, correct path). This
+          # overrides any value setup-android may have assigned to ANDROID_HOME.
+          export ANDROID_HOME="/usr/local/lib/android/sdk"
+          sdkmanager "platforms;android-33" "build-tools;33.0.0" "ndk;${{ env.NDK_VERSION }}" "cmake;3.22.1"
+          echo "ANDROID_HOME=$ANDROID_HOME" >> "$GITHUB_ENV"
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-linux-android
+      - name: Install cargo-ndk + cbindgen
+        # Install only if missing, so a restored cargo/bin cache never triggers
+        # a spurious "already installed" failure.
+        run: |
+          command -v cargo-ndk >/dev/null 2>&1 || cargo install cargo-ndk --version "${{ env.CARGO_NDK_VERSION }}"
+          command -v cbindgen  >/dev/null 2>&1 || cargo install cbindgen --version "${{ env.CBINDGEN_VERSION }}"
+
+      - name: Cache cargo registry + bin + target
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            ~/.cargo/bin
+            /tmp/alvr_target
+          key: ${{ runner.os }}-cargo-${{ env.ALVR_TAG }}-${{ hashFiles('**/Cargo.lock') }}
+          restore-keys: |
+            ${{ runner.os }}-cargo-${{ env.ALVR_TAG }}-
+
+      - name: Build alvr_client_core + generate header + stage artifacts
+        # build.sh only compiles the Rust core and stages the .so + header.
+        # It does NOT build the APK (Gradle runs in a later step).
+        run: bash build.sh
+        env:
+          ANDROID_HOME: ${{ env.ANDROID_HOME }}
+
+      - name: Install Gradle ${{ env.GRADLE_VERSION }}
+        run: |
+          wget -q "https://services.gradle.org/distributions/gradle-${{ env.GRADLE_VERSION }}-all.zip" -O /tmp/gradle.zip
+          unzip -q /tmp/gradle.zip -d "$HOME/gradle"
+          echo "$HOME/gradle/gradle-${{ env.GRADLE_VERSION }}/bin" >> "$GITHUB_PATH"
+
+      - name: Build release APK
+        run: gradle assembleRelease
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: alvr-qiyu-apk
+          path: app/build/outputs/apk/release/*.apk
+          if-no-files-found: error
+
+      - name: Upload diagnostics on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: alvr-build-diagnostics
+          path: |
+            build/alvr_client_core/include/alvr_client_core.h
+            app/src/main/cpp/cpp_main.cpp
+            app/build/**/*.txt
+            app/build/**/*.log
+          if-no-files-found: ignore
